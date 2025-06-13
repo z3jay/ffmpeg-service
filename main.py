@@ -10,6 +10,7 @@ import logging
 from typing import Optional, List, Dict, Any, Union
 import json
 import re
+import shlex
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -120,7 +121,15 @@ async def process_named_media(request: Request):
                 }
                 file_paths[field_name] = str(input_path)
                 
-                logger.info(f"Job {job_id}: Saved file '{field_name}': {filename}")
+                logger.info(f"Job {job_id}: Saved file '{field_name}': {filename} -> {input_path}")
+                
+                # Verify the file actually exists
+                if not input_path.exists():
+                    logger.error(f"Job {job_id}: File was not saved correctly: {input_path}")
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"Failed to save file {field_name}"
+                    )
         
         if not uploaded_files:
             raise HTTPException(
@@ -137,9 +146,18 @@ async def process_named_media(request: Request):
         
         # Replace placeholders in command with actual file paths
         processed_command = command
+        logger.info(f"Job {job_id}: Original command: {command}")
+        logger.info(f"Job {job_id}: Available file paths: {file_paths}")
+        
         for file_name, file_path in file_paths.items():
             placeholder = f"{{{file_name}}}"
-            processed_command = processed_command.replace(placeholder, f'"{file_path}"')
+            if placeholder in processed_command:
+                processed_command = processed_command.replace(placeholder, f'"{file_path}"')
+                logger.info(f"Job {job_id}: Replaced {placeholder} with {file_path}")
+            else:
+                logger.warning(f"Job {job_id}: Placeholder {placeholder} not found in command")
+        
+        logger.info(f"Job {job_id}: Processed command: {processed_command}")
         
         # Check if command contains input specifications
         if not processed_command.strip():
@@ -148,8 +166,16 @@ async def process_named_media(request: Request):
                 detail="Command cannot be empty"
             )
         
-        # Add the processed command
-        ffmpeg_cmd.extend(processed_command.split())
+        # Parse the processed command properly to handle quoted arguments
+        try:
+            parsed_args = shlex.split(processed_command)
+            ffmpeg_cmd.extend(parsed_args)
+        except ValueError as e:
+            logger.error(f"Job {job_id}: Failed to parse command: {processed_command}")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid command syntax: {str(e)}"
+            )
         
         # Add output file
         ffmpeg_cmd.append(str(output_path))
