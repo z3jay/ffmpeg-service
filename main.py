@@ -1,4 +1,4 @@
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request
 from fastapi.responses import FileResponse
 import subprocess
 import os
@@ -9,6 +9,7 @@ from pathlib import Path
 import logging
 from typing import Optional, List, Dict, Any, Union
 import json
+import re
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -35,6 +36,7 @@ async def root():
         "version": "1.0.0",
         "endpoints": {
             "/process": "POST - Process single or multiple files with FFmpeg commands",
+            "/process-named": "POST - Process named files with custom FFmpeg commands",
             "/health": "GET - Health check"
         }
     }
@@ -57,6 +59,153 @@ async def health_check():
             "ffmpeg_available": False,
             "error": str(e)
         }
+
+@app.post("/process-named")
+async def process_named_media(request: Request):
+    """
+    Process media files with custom names that can be referenced in FFmpeg commands.
+    
+    Form Fields:
+        - Any number of file uploads with custom names (e.g., 'main_video', 'background_audio', 'overlay')
+        - command (required): FFmpeg command using placeholders for file names
+        - output_format (optional): Output file extension (default: 'mp4')
+    
+    Example command: "-i {main_video} -i {background_audio} -c:v copy -c:a aac -shortest"
+    
+    The placeholders {file_name} will be replaced with actual file paths.
+    """
+    
+    # Generate unique ID for this processing job
+    job_id = str(uuid.uuid4())
+    logger.info(f"Starting named file job {job_id}")
+    
+    # Create job-specific directories
+    job_input_dir = INPUT_DIR / job_id
+    job_output_dir = OUTPUT_DIR / job_id
+    job_input_dir.mkdir(exist_ok=True)
+    job_output_dir.mkdir(exist_ok=True)
+    
+    try:
+        # Parse form data
+        form_data = await request.form()
+        
+        # Extract command and options
+        command = form_data.get("command")
+        output_format = form_data.get("output_format", "mp4")
+        
+        if not command:
+            raise HTTPException(
+                status_code=400,
+                detail="'command' parameter is required"
+            )
+        
+        # Find all file uploads and non-file parameters
+        uploaded_files = {}
+        file_paths = {}
+        
+        for field_name, field_value in form_data.items():
+            if hasattr(field_value, 'filename'):  # It's a file upload
+                # Save the uploaded file
+                filename = field_value.filename or f"{field_name}"
+                input_path = job_input_dir / f"{field_name}_{filename}"
+                
+                with open(input_path, "wb") as buffer:
+                    content = await field_value.read()
+                    buffer.write(content)
+                
+                uploaded_files[field_name] = {
+                    'path': str(input_path),
+                    'filename': filename,
+                    'size': len(content)
+                }
+                file_paths[field_name] = str(input_path)
+                
+                logger.info(f"Job {job_id}: Saved file '{field_name}': {filename}")
+        
+        if not uploaded_files:
+            raise HTTPException(
+                status_code=400,
+                detail="At least one file upload is required"
+            )
+        
+        # Determine output filename and format
+        output_filename = f"output.{output_format.lstrip('.')}"
+        output_path = job_output_dir / output_filename
+        
+        # Build FFmpeg command by replacing placeholders
+        ffmpeg_cmd = ["ffmpeg", "-y"]  # Overwrite output files
+        
+        # Replace placeholders in command with actual file paths
+        processed_command = command
+        for file_name, file_path in file_paths.items():
+            placeholder = f"{{{file_name}}}"
+            processed_command = processed_command.replace(placeholder, f'"{file_path}"')
+        
+        # Check if command contains input specifications
+        if not processed_command.strip():
+            raise HTTPException(
+                status_code=400,
+                detail="Command cannot be empty"
+            )
+        
+        # Add the processed command
+        ffmpeg_cmd.extend(processed_command.split())
+        
+        # Add output file
+        ffmpeg_cmd.append(str(output_path))
+        
+        logger.info(f"Job {job_id}: Running FFmpeg command: {' '.join(ffmpeg_cmd)}")
+        
+        # Execute FFmpeg command
+        result = subprocess.run(
+            ffmpeg_cmd,
+            capture_output=True,
+            text=True,
+            timeout=600
+        )
+        
+        if result.returncode != 0:
+            logger.error(f"Job {job_id}: FFmpeg failed with return code {result.returncode}")
+            logger.error(f"Job {job_id}: FFmpeg stderr: {result.stderr}")
+            raise HTTPException(
+                status_code=400,
+                detail=f"FFmpeg processing failed: {result.stderr}"
+            )
+        
+        # Check if output file was created
+        if not output_path.exists():
+            raise HTTPException(
+                status_code=500,
+                detail="Output file was not created"
+            )
+        
+        logger.info(f"Job {job_id}: Named file processing completed successfully")
+        
+        # Return the processed file
+        return FileResponse(
+            path=str(output_path),
+            filename=output_filename,
+            media_type="application/octet-stream"
+        )
+        
+    except subprocess.TimeoutExpired:
+        logger.error(f"Job {job_id}: FFmpeg command timed out")
+        raise HTTPException(status_code=408, detail="Processing timed out")
+    
+    except Exception as e:
+        logger.error(f"Job {job_id}: Error processing named files: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error processing named files: {str(e)}")
+    
+    finally:
+        # Cleanup temporary files
+        try:
+            if job_input_dir.exists():
+                shutil.rmtree(job_input_dir)
+            if job_output_dir.exists():
+                shutil.rmtree(job_output_dir)
+            logger.info(f"Job {job_id}: Cleaned up temporary files")
+        except Exception as e:
+            logger.warning(f"Job {job_id}: Failed to cleanup temporary files: {str(e)}")
 
 @app.post("/process")
 async def process_media(
