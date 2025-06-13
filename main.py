@@ -11,6 +11,8 @@ from typing import Optional, List, Dict, Any, Union
 import json
 import re
 import shlex
+import threading
+import time
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -284,15 +286,28 @@ async def process_named_media(request: Request):
         raise HTTPException(status_code=500, detail=f"Error processing named files: {str(e)}")
     
     finally:
-        # Cleanup temporary files
+        # Only cleanup input files immediately, leave output file for later cleanup
         try:
             if job_input_dir.exists():
                 shutil.rmtree(job_input_dir)
-            if job_output_dir.exists():
-                shutil.rmtree(job_output_dir)
-            logger.info(f"Job {job_id}: Cleaned up temporary files")
+            logger.info(f"Job {job_id}: Cleaned up input files")
         except Exception as e:
-            logger.warning(f"Job {job_id}: Failed to cleanup temporary files: {str(e)}")
+            logger.warning(f"Job {job_id}: Failed to cleanup input files: {str(e)}")
+        
+        # Schedule output cleanup after a delay to allow file serving to complete
+        def delayed_cleanup():
+            time.sleep(30)  # Wait 30 seconds before cleanup
+            try:
+                if job_output_dir.exists():
+                    shutil.rmtree(job_output_dir)
+                logger.info(f"Job {job_id}: Cleaned up output files (delayed)")
+            except Exception as e:
+                logger.warning(f"Job {job_id}: Failed to cleanup output files (delayed): {str(e)}")
+        
+        # Start cleanup in background thread
+        cleanup_thread = threading.Thread(target=delayed_cleanup)
+        cleanup_thread.daemon = True
+        cleanup_thread.start()
 
 @app.post("/process")
 async def process_media(
@@ -472,15 +487,28 @@ async def process_media(
         raise HTTPException(status_code=500, detail=f"Error processing file(s): {str(e)}")
     
     finally:
-        # Cleanup temporary files
+        # Only cleanup input files immediately, leave output file for later cleanup
         try:
             if job_input_dir.exists():
                 shutil.rmtree(job_input_dir)
-            if job_output_dir.exists():
-                shutil.rmtree(job_output_dir)
-            logger.info(f"Job {job_id}: Cleaned up temporary files")
+            logger.info(f"Job {job_id}: Cleaned up input files")
         except Exception as e:
-            logger.warning(f"Job {job_id}: Failed to cleanup temporary files: {str(e)}")
+            logger.warning(f"Job {job_id}: Failed to cleanup input files: {str(e)}")
+        
+        # Schedule output cleanup after a delay to allow file serving to complete
+        def delayed_cleanup():
+            time.sleep(30)  # Wait 30 seconds before cleanup
+            try:
+                if job_output_dir.exists():
+                    shutil.rmtree(job_output_dir)
+                logger.info(f"Job {job_id}: Cleaned up output files (delayed)")
+            except Exception as e:
+                logger.warning(f"Job {job_id}: Failed to cleanup output files (delayed): {str(e)}")
+        
+        # Start cleanup in background thread
+        cleanup_thread = threading.Thread(target=delayed_cleanup)
+        cleanup_thread.daemon = True
+        cleanup_thread.start()
 
 def _build_concat_command(input_paths: List[str], output_path: str, options: Dict[str, Any]) -> List[str]:
     """Build FFmpeg command for concatenating videos/audios."""
