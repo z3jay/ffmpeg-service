@@ -16,6 +16,36 @@ import shlex
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+def detect_streams(file_path: str) -> Dict[str, bool]:
+    """
+    Detect what types of streams (video, audio) are available in a media file.
+    Returns a dict with 'has_video' and 'has_audio' keys.
+    """
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-show_streams", "-print_format", "json", file_path],
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+        
+        if result.returncode != 0:
+            logger.warning(f"ffprobe failed for {file_path}: {result.stderr}")
+            return {"has_video": True, "has_audio": True}  # Assume both to be safe
+        
+        data = json.loads(result.stdout)
+        streams = data.get("streams", [])
+        
+        has_video = any(stream.get("codec_type") == "video" for stream in streams)
+        has_audio = any(stream.get("codec_type") == "audio" for stream in streams)
+        
+        logger.info(f"Stream detection for {file_path}: video={has_video}, audio={has_audio}")
+        return {"has_video": has_video, "has_audio": has_audio}
+        
+    except Exception as e:
+        logger.warning(f"Failed to detect streams for {file_path}: {str(e)}")
+        return {"has_video": True, "has_audio": True}  # Assume both to be safe
+
 app = FastAPI(
     title="FFmpeg Microservice API",
     description="A microservice for processing media files using FFmpeg commands",
@@ -141,6 +171,11 @@ async def process_named_media(request: Request):
         output_filename = f"output.{output_format.lstrip('.')}"
         output_path = job_output_dir / output_filename
         
+        # Detect stream types in the first uploaded file to determine processing strategy
+        first_file_path = list(file_paths.values())[0]
+        stream_info = detect_streams(first_file_path)
+        logger.info(f"Job {job_id}: Stream detection for first file: {stream_info}")
+        
         # Build FFmpeg command by replacing placeholders
         ffmpeg_cmd = ["ffmpeg", "-y"]  # Overwrite output files
         
@@ -148,6 +183,32 @@ async def process_named_media(request: Request):
         processed_command = command
         logger.info(f"Job {job_id}: Original command: {command}")
         logger.info(f"Job {job_id}: Available file paths: {file_paths}")
+        
+        # Smart command adjustment for concat operations
+        if "concat=n=" in processed_command and ":v=1:a=1" in processed_command:
+            if not stream_info["has_audio"]:
+                logger.info(f"Job {job_id}: No audio streams detected, adjusting concat filter to video-only")
+                # Replace audio parameters in concat filter
+                processed_command = processed_command.replace(":v=1:a=1[outv][outa]", ":v=1:a=0[outv]")
+                # Remove audio mapping
+                processed_command = processed_command.replace('-map "[outv]" -map "[outa]"', '-map "[outv]"')
+                # Remove audio codec specification
+                processed_command = processed_command.replace(" -c:a aac", "")
+                processed_command = processed_command.replace(" -c:a", "")
+                logger.info(f"Job {job_id}: Adjusted command for video-only: {processed_command}")
+        
+        # Handle xfade filter for video-only files
+        if "xfade=" in processed_command and not stream_info["has_audio"]:
+            if "acrossfade" in processed_command:
+                logger.info(f"Job {job_id}: Removing audio crossfade for video-only files")
+                # Remove the audio crossfade part and simplify to video-only
+                # Convert xfade command to simple concat for video-only
+                if "[0:v][1:v]xfade=" in processed_command:
+                    processed_command = processed_command.replace(
+                        '"[0:v][1:v]xfade=transition=fade:duration=1:offset=5[v];[0:a][1:a]acrossfade=d=1[a]" -map "[v]" -map "[a]"',
+                        '"concat=n=2:v=1:a=0[outv]" -map "[outv]"'
+                    )
+                    logger.info(f"Job {job_id}: Converted xfade to concat for video-only: {processed_command}")
         
         for file_name, file_path in file_paths.items():
             placeholder = f"{{{file_name}}}"
