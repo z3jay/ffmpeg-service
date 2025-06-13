@@ -7,7 +7,7 @@ import shutil
 import uuid
 from pathlib import Path
 import logging
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Union
 import json
 
 # Configure logging
@@ -34,9 +34,8 @@ async def root():
         "message": "FFmpeg Microservice API",
         "version": "1.0.0",
         "endpoints": {
-            "/process": "POST - Process files with FFmpeg commands",
-            "/health": "GET - Health check",
-            "/process-multi": "POST - Process multiple files with FFmpeg for complex operations"
+            "/process": "POST - Process single or multiple files with FFmpeg commands",
+            "/health": "GET - Health check"
         }
     }
 
@@ -61,24 +60,65 @@ async def health_check():
 
 @app.post("/process")
 async def process_media(
-    file: UploadFile = File(...),
-    command: str = Form(...),
-    output_format: Optional[str] = Form(default=None)
+    files: Union[UploadFile, List[UploadFile]] = File(...),
+    command: Optional[str] = Form(default=None),
+    operation: Optional[str] = Form(default=None),
+    output_format: Optional[str] = Form(default=None),
+    options: Optional[str] = Form(default=None)
 ):
     """
-    Process a media file using FFmpeg command.
+    Process single or multiple media files using FFmpeg.
     
-    Args:
-        file: Input media file
-        command: FFmpeg command (without input/output file paths)
-        output_format: Output file extension (e.g., 'mp4', 'avi', 'wav')
+    Single File Mode:
+        - files: Single media file
+        - command: FFmpeg command (without input/output paths)
+        - output_format: Output file extension
     
-    Example command: "-vf scale=640:480 -c:v libx264 -preset fast"
+    Multiple Files Mode:
+        - files: List of media files (2+)
+        - operation: Type of operation ('concat', 'mix_audio', 'overlay', 'merge_av', 'custom')
+        - command: Custom FFmpeg command (required for 'custom' operation)
+        - output_format: Output file extension (default: 'mp4')
+        - options: JSON string with operation-specific options
+    
+    Multi-Input Operations:
+        - concat: Concatenate videos or audios
+        - mix_audio: Mix multiple audio tracks
+        - overlay: Overlay videos (picture-in-picture)
+        - merge_av: Merge separate audio and video files
+        - custom: Use custom FFmpeg command with multiple inputs
     """
+    
+    # Handle both single file and multiple files input
+    if isinstance(files, list):
+        file_list = files
+        is_multi_input = len(file_list) > 1
+    else:
+        file_list = [files]
+        is_multi_input = False
+    
+    # Validate inputs
+    if is_multi_input:
+        if not operation:
+            raise HTTPException(
+                status_code=400, 
+                detail="'operation' parameter is required for multiple files (concat, mix_audio, overlay, merge_av, custom)"
+            )
+        if operation == "custom" and not command:
+            raise HTTPException(
+                status_code=400, 
+                detail="'command' parameter is required for custom multi-input operations"
+            )
+    else:
+        if not command:
+            raise HTTPException(
+                status_code=400, 
+                detail="'command' parameter is required for single file processing"
+            )
     
     # Generate unique ID for this processing job
     job_id = str(uuid.uuid4())
-    logger.info(f"Starting job {job_id}")
+    logger.info(f"Starting job {job_id} ({'multi-input' if is_multi_input else 'single'} mode)")
     
     # Create job-specific directories
     job_input_dir = INPUT_DIR / job_id
@@ -87,47 +127,80 @@ async def process_media(
     job_output_dir.mkdir(exist_ok=True)
     
     try:
-        # Save uploaded file
-        input_filename = file.filename or "input_file"
-        input_path = job_input_dir / input_filename
+        # Parse options if provided (for multi-input operations)
+        parsed_options = {}
+        if options:
+            try:
+                parsed_options = json.loads(options)
+            except json.JSONDecodeError:
+                raise HTTPException(status_code=400, detail="Invalid JSON in options parameter")
         
-        with open(input_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-        
-        logger.info(f"Job {job_id}: Saved input file {input_filename}")
+        # Save uploaded files
+        input_paths = []
+        for i, file in enumerate(file_list):
+            filename = file.filename or f"input_{i}"
+            input_path = job_input_dir / (f"{i}_{filename}" if is_multi_input else filename)
+            
+            with open(input_path, "wb") as buffer:
+                shutil.copyfileobj(file.file, buffer)
+            
+            input_paths.append(str(input_path))
+            logger.info(f"Job {job_id}: Saved input file {i}: {filename}")
         
         # Determine output filename and format
         if output_format:
             output_filename = f"output.{output_format.lstrip('.')}"
         else:
-            # Use same extension as input file
-            input_ext = Path(input_filename).suffix
-            output_filename = f"output{input_ext}"
+            if is_multi_input:
+                output_filename = "output.mp4"  # Default for multi-input
+            else:
+                # Use same extension as input file for single input
+                input_ext = Path(file_list[0].filename or "input").suffix
+                output_filename = f"output{input_ext}"
         
         output_path = job_output_dir / output_filename
         
         # Build FFmpeg command
-        ffmpeg_cmd = [
-            "ffmpeg",
-            "-y",  # Overwrite output files without asking
-            "-i", str(input_path),  # Input file
-        ]
-        
-        # Add user's command (split by spaces, but this is basic - might need more sophisticated parsing)
-        if command.strip():
-            ffmpeg_cmd.extend(command.split())
-        
-        # Add output file
-        ffmpeg_cmd.append(str(output_path))
+        if is_multi_input:
+            # Multi-input processing
+            ffmpeg_cmd = ["ffmpeg", "-y"]  # Overwrite output files
+            
+            if operation == "concat":
+                ffmpeg_cmd.extend(_build_concat_command(input_paths, str(output_path), parsed_options))
+            elif operation == "mix_audio":
+                ffmpeg_cmd.extend(_build_mix_audio_command(input_paths, str(output_path), parsed_options))
+            elif operation == "overlay":
+                ffmpeg_cmd.extend(_build_overlay_command(input_paths, str(output_path), parsed_options))
+            elif operation == "merge_av":
+                ffmpeg_cmd.extend(_build_merge_av_command(input_paths, str(output_path), parsed_options))
+            elif operation == "custom":
+                ffmpeg_cmd.extend(_build_custom_command(input_paths, str(output_path), command))
+            else:
+                raise HTTPException(status_code=400, detail=f"Unknown operation: {operation}")
+        else:
+            # Single file processing (original logic)
+            ffmpeg_cmd = [
+                "ffmpeg",
+                "-y",  # Overwrite output files without asking
+                "-i", input_paths[0],  # Input file
+            ]
+            
+            # Add user's command
+            if command.strip():
+                ffmpeg_cmd.extend(command.split())
+            
+            # Add output file
+            ffmpeg_cmd.append(str(output_path))
         
         logger.info(f"Job {job_id}: Running FFmpeg command: {' '.join(ffmpeg_cmd)}")
         
-        # Execute FFmpeg command
+        # Execute FFmpeg command with appropriate timeout
+        timeout = 600 if is_multi_input else 300  # 10 min for multi-input, 5 min for single
         result = subprocess.run(
             ffmpeg_cmd,
             capture_output=True,
             text=True,
-            timeout=300  # 5 minute timeout
+            timeout=timeout
         )
         
         if result.returncode != 0:
@@ -159,149 +232,8 @@ async def process_media(
         raise HTTPException(status_code=408, detail="Processing timed out")
     
     except Exception as e:
-        logger.error(f"Job {job_id}: Error processing file: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error processing file: {str(e)}")
-    
-    finally:
-        # Cleanup temporary files
-        try:
-            if job_input_dir.exists():
-                shutil.rmtree(job_input_dir)
-            if job_output_dir.exists():
-                shutil.rmtree(job_output_dir)
-            logger.info(f"Job {job_id}: Cleaned up temporary files")
-        except Exception as e:
-            logger.warning(f"Job {job_id}: Failed to cleanup temporary files: {str(e)}")
-
-@app.post("/process-multi")
-async def process_multi_media(
-    files: List[UploadFile] = File(...),
-    operation: str = Form(...),
-    command: Optional[str] = Form(default=None),
-    output_format: Optional[str] = Form(default="mp4"),
-    options: Optional[str] = Form(default=None)
-):
-    """
-    Process multiple media files using FFmpeg for complex operations.
-    
-    Args:
-        files: List of input media files
-        operation: Type of operation ('concat', 'mix_audio', 'overlay', 'merge_av', 'custom')
-        command: Custom FFmpeg command (for 'custom' operation)
-        output_format: Output file extension (default: 'mp4')
-        options: JSON string with operation-specific options
-    
-    Operations:
-        - concat: Concatenate videos or audios
-        - mix_audio: Mix multiple audio tracks
-        - overlay: Overlay videos (picture-in-picture)
-        - merge_av: Merge separate audio and video files
-        - custom: Use custom FFmpeg command with multiple inputs
-    
-    Options examples:
-        - concat: {"transition": "fade", "duration": 1.0}
-        - mix_audio: {"normalize": true, "volumes": [1.0, 0.8, 0.6]}
-        - overlay: {"positions": [{"x": 0, "y": 0}, {"x": 10, "y": 10}]}
-        - merge_av: {"video_index": 0, "audio_index": 1}
-    """
-    
-    if len(files) < 2:
-        raise HTTPException(status_code=400, detail="At least 2 files are required for multi-input operations")
-    
-    # Generate unique ID for this processing job
-    job_id = str(uuid.uuid4())
-    logger.info(f"Starting multi-input job {job_id} with operation: {operation}")
-    
-    # Create job-specific directories
-    job_input_dir = INPUT_DIR / job_id
-    job_output_dir = OUTPUT_DIR / job_id
-    job_input_dir.mkdir(exist_ok=True)
-    job_output_dir.mkdir(exist_ok=True)
-    
-    try:
-        # Parse options if provided
-        parsed_options = {}
-        if options:
-            try:
-                parsed_options = json.loads(options)
-            except json.JSONDecodeError:
-                raise HTTPException(status_code=400, detail="Invalid JSON in options parameter")
-        
-        # Save uploaded files
-        input_paths = []
-        for i, file in enumerate(files):
-            filename = file.filename or f"input_{i}"
-            input_path = job_input_dir / f"{i}_{filename}"
-            
-            with open(input_path, "wb") as buffer:
-                shutil.copyfileobj(file.file, buffer)
-            
-            input_paths.append(str(input_path))
-            logger.info(f"Job {job_id}: Saved input file {i}: {filename}")
-        
-        # Determine output filename
-        output_filename = f"output.{output_format.lstrip('.')}"
-        output_path = job_output_dir / output_filename
-        
-        # Build FFmpeg command based on operation
-        ffmpeg_cmd = ["ffmpeg", "-y"]  # Overwrite output files
-        
-        if operation == "concat":
-            ffmpeg_cmd.extend(_build_concat_command(input_paths, str(output_path), parsed_options))
-        elif operation == "mix_audio":
-            ffmpeg_cmd.extend(_build_mix_audio_command(input_paths, str(output_path), parsed_options))
-        elif operation == "overlay":
-            ffmpeg_cmd.extend(_build_overlay_command(input_paths, str(output_path), parsed_options))
-        elif operation == "merge_av":
-            ffmpeg_cmd.extend(_build_merge_av_command(input_paths, str(output_path), parsed_options))
-        elif operation == "custom":
-            if not command:
-                raise HTTPException(status_code=400, detail="Custom operation requires a command parameter")
-            ffmpeg_cmd.extend(_build_custom_command(input_paths, str(output_path), command))
-        else:
-            raise HTTPException(status_code=400, detail=f"Unknown operation: {operation}")
-        
-        logger.info(f"Job {job_id}: Running FFmpeg command: {' '.join(ffmpeg_cmd)}")
-        
-        # Execute FFmpeg command
-        result = subprocess.run(
-            ffmpeg_cmd,
-            capture_output=True,
-            text=True,
-            timeout=600  # 10 minute timeout for complex operations
-        )
-        
-        if result.returncode != 0:
-            logger.error(f"Job {job_id}: FFmpeg failed with return code {result.returncode}")
-            logger.error(f"Job {job_id}: FFmpeg stderr: {result.stderr}")
-            raise HTTPException(
-                status_code=400,
-                detail=f"FFmpeg processing failed: {result.stderr}"
-            )
-        
-        # Check if output file was created
-        if not output_path.exists():
-            raise HTTPException(
-                status_code=500,
-                detail="Output file was not created"
-            )
-        
-        logger.info(f"Job {job_id}: Multi-input processing completed successfully")
-        
-        # Return the processed file
-        return FileResponse(
-            path=str(output_path),
-            filename=output_filename,
-            media_type="application/octet-stream"
-        )
-        
-    except subprocess.TimeoutExpired:
-        logger.error(f"Job {job_id}: FFmpeg command timed out")
-        raise HTTPException(status_code=408, detail="Processing timed out")
-    
-    except Exception as e:
-        logger.error(f"Job {job_id}: Error processing files: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error processing files: {str(e)}")
+        logger.error(f"Job {job_id}: Error processing file(s): {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error processing file(s): {str(e)}")
     
     finally:
         # Cleanup temporary files

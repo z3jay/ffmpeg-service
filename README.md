@@ -5,9 +5,9 @@ A Docker-based microservice API for processing media files using FFmpeg commands
 ## Features
 
 - **RESTful API**: FastAPI-based service with automatic documentation
-- **Single File Processing**: Accept media files via multipart/form-data
-- **Multi-Input Operations**: Combine multiple videos and audios with complex operations
+- **Single & Multi-File Processing**: Handle single files or combine multiple videos and audios
 - **Custom FFmpeg Commands**: Execute any FFmpeg command on uploaded files
+- **Complex Operations**: Concatenation, audio mixing, video overlay, and more
 - **File Download**: Return processed files directly through the API
 - **Health Monitoring**: Built-in health check endpoint
 - **Automatic Cleanup**: Temporary files are automatically cleaned up after processing
@@ -39,25 +39,22 @@ A Docker-based microservice API for processing media files using FFmpeg commands
 ### Health Check
 - **GET** `/health` - Check service health and FFmpeg availability
 
-### Process Single Media File
-- **POST** `/process` - Process a media file with FFmpeg
+### Process Media Files
+- **POST** `/process` - Process single or multiple media files with FFmpeg
 
-#### Parameters:
-- `file` (required): Media file to process
+#### Single File Mode Parameters:
+- `files` (required): Single media file
 - `command` (required): FFmpeg command (without input/output paths)
 - `output_format` (optional): Output file extension (e.g., 'mp4', 'avi', 'wav')
 
-### Process Multiple Media Files
-- **POST** `/process-multi` - Process multiple media files with complex operations
-
-#### Parameters:
-- `files` (required): List of media files to process
+#### Multiple Files Mode Parameters:
+- `files` (required): List of media files (2 or more)
 - `operation` (required): Type of operation ('concat', 'mix_audio', 'overlay', 'merge_av', 'custom')
 - `command` (optional): Custom FFmpeg command (required for 'custom' operation)
 - `output_format` (optional): Output file extension (default: 'mp4')
 - `options` (optional): JSON string with operation-specific options
 
-#### Supported Operations:
+#### Multi-Input Operations:
 - **concat**: Concatenate videos or audios sequentially
 - **mix_audio**: Mix multiple audio tracks together
 - **overlay**: Overlay videos (picture-in-picture effect)
@@ -66,10 +63,12 @@ A Docker-based microservice API for processing media files using FFmpeg commands
 
 ## Usage Examples
 
+### Single File Processing
+
 ### Example 1: Convert Video to Different Format
 ```bash
 curl -X POST "http://localhost:8000/process" \
-  -F "file=@input.mov" \
+  -F "files=@input.mov" \
   -F "command=-c:v libx264 -preset fast -crf 23" \
   -F "output_format=mp4" \
   --output converted.mp4
@@ -78,7 +77,7 @@ curl -X POST "http://localhost:8000/process" \
 ### Example 2: Resize Video
 ```bash
 curl -X POST "http://localhost:8000/process" \
-  -F "file=@large_video.mp4" \
+  -F "files=@large_video.mp4" \
   -F "command=-vf scale=640:480 -c:v libx264 -preset fast" \
   --output resized_video.mp4
 ```
@@ -86,7 +85,7 @@ curl -X POST "http://localhost:8000/process" \
 ### Example 3: Extract Audio from Video
 ```bash
 curl -X POST "http://localhost:8000/process" \
-  -F "file=@video.mp4" \
+  -F "files=@video.mp4" \
   -F "command=-vn -acodec copy" \
   -F "output_format=aac" \
   --output audio.aac
@@ -95,7 +94,7 @@ curl -X POST "http://localhost:8000/process" \
 ### Example 4: Convert Audio Format
 ```bash
 curl -X POST "http://localhost:8000/process" \
-  -F "file=@audio.wav" \
+  -F "files=@audio.wav" \
   -F "command=-acodec mp3 -ab 192k" \
   -F "output_format=mp3" \
   --output converted_audio.mp3
@@ -104,17 +103,17 @@ curl -X POST "http://localhost:8000/process" \
 ### Example 5: Create Video Thumbnail
 ```bash
 curl -X POST "http://localhost:8000/process" \
-  -F "file=@video.mp4" \
+  -F "files=@video.mp4" \
   -F "command=-ss 00:00:01 -vframes 1" \
   -F "output_format=jpg" \
   --output thumbnail.jpg
 ```
 
-## Multi-Input Usage Examples
+### Multiple File Processing
 
 ### Example 1: Concatenate Multiple Videos
 ```bash
-curl -X POST "http://localhost:8000/process-multi" \
+curl -X POST "http://localhost:8000/process" \
   -F "files=@video1.mp4" \
   -F "files=@video2.mp4" \
   -F "files=@video3.mp4" \
@@ -125,7 +124,7 @@ curl -X POST "http://localhost:8000/process-multi" \
 
 ### Example 2: Concatenate Videos with Fade Transitions
 ```bash
-curl -X POST "http://localhost:8000/process-multi" \
+curl -X POST "http://localhost:8000/process" \
   -F "files=@video1.mp4" \
   -F "files=@video2.mp4" \
   -F "operation=concat" \
@@ -136,7 +135,7 @@ curl -X POST "http://localhost:8000/process-multi" \
 
 ### Example 3: Mix Multiple Audio Tracks
 ```bash
-curl -X POST "http://localhost:8000/process-multi" \
+curl -X POST "http://localhost:8000/process" \
   -F "files=@music.mp3" \
   -F "files=@vocals.wav" \
   -F "files=@drums.aac" \
@@ -148,7 +147,7 @@ curl -X POST "http://localhost:8000/process-multi" \
 
 ### Example 4: Picture-in-Picture Video Overlay
 ```bash
-curl -X POST "http://localhost:8000/process-multi" \
+curl -X POST "http://localhost:8000/process" \
   -F "files=@main_video.mp4" \
   -F "files=@overlay_video.mp4" \
   -F "operation=overlay" \
@@ -159,7 +158,7 @@ curl -X POST "http://localhost:8000/process-multi" \
 
 ### Example 5: Merge Separate Audio and Video Files
 ```bash
-curl -X POST "http://localhost:8000/process-multi" \
+curl -X POST "http://localhost:8000/process" \
   -F "files=@video_only.mp4" \
   -F "files=@audio_only.mp3" \
   -F "operation=merge_av" \
@@ -170,7 +169,7 @@ curl -X POST "http://localhost:8000/process-multi" \
 
 ### Example 6: Custom Multi-Input Operation
 ```bash
-curl -X POST "http://localhost:8000/process-multi" \
+curl -X POST "http://localhost:8000/process" \
   -F "files=@input1.mp4" \
   -F "files=@input2.mp4" \
   -F "operation=custom" \
